@@ -91,7 +91,7 @@ def main():
     folds = make_folds(meta, cfg.n_folds, cfg.seed)
     meta.assign(fold=folds)[["image_id", "lesion_id", "dx", "fold"]].to_csv(os.path.join(cfg.out_dir, "folds.csv"),
                                                                            index=False)
-    order = [s for s in STRATEGIES if s in cfg.strategies]
+    order = list(dict.fromkeys(cfg.strategies))          # command-line order; sup50 must precede selftrain
     for k in cfg.folds:
         splits = fold_splits(meta, folds, k, cfg)
         save_splits(meta, splits, os.path.join(cfg.out_dir, "splits", f"fold{k}.json"))

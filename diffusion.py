@@ -22,7 +22,8 @@ C = len(CLASSES)
 def _unet(cfg):
     from diffusers import UNet2DModel
     r = cfg.diff_resolution
-    ch = (64, 128, 256, 256, 512) if r >= 128 else (64, 128, 256, 256)
+    ch = tuple(int(x) for x in cfg.diff_channels.split(",")) if cfg.diff_channels else \
+        ((64, 128, 256, 256, 512) if r >= 128 else (64, 128, 256, 256))
     blocks_down = ("DownBlock2D",) * (len(ch) - 2) + ("AttnDownBlock2D", "DownBlock2D")
     blocks_up = ("UpBlock2D", "AttnUpBlock2D") + ("UpBlock2D",) * (len(ch) - 2)
     return UNet2DModel(sample_size=r, in_channels=3, out_channels=3, layers_per_block=2,

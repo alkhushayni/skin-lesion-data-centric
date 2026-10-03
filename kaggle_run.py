@@ -21,20 +21,24 @@ OUT = os.path.join(W, "results", "main")
 CACHE = os.path.join(W, "cache")
 
 COMMON_SET = ["batch_size=32", "max_epochs=30", "patience=5", "num_workers=2", "diff_resolution=64",
-              "diff_train_steps=12000", "diff_batch_size=64", "st_iterations=3", "st_epochs_per_round=8",
-              "al_epochs_per_round=6", "fixmatch_epochs=25", "bald_mc_samples=8", "quality_samples=150"]
+              "diff_channels=64,128,128,256", "diff_train_steps=5000", "diff_batch_size=32", "diff_sample_steps=25",
+              "st_iterations=3", "st_epochs_per_round=8", "al_epochs_per_round=6", "fixmatch_epochs=25",
+              "bald_mc_samples=8", "quality_samples=150"]
+BUDGET = ["sup50", "selftrain", "st_cwl", "fixmatch", "random", "al_entropy", "al_bald", "al_coreset"]
+FULL = ["baseline", "cwl", "focal", "oversample"]
 
 STAGES = {
-    # GPU0 / GPU1: (models, budget models, strategies)
-    "A": [(["resnet50"], ["resnet50"],
-           ["baseline", "cwl", "focal", "oversample", "diffusion", "sup50", "selftrain", "st_cwl", "fixmatch",
-            "random", "al_entropy", "al_bald", "al_coreset"]),
-          (["efficientnet_b0"], ["efficientnet_b0"],
-           ["baseline", "cwl", "focal", "oversample", "diffusion", "sup50", "selftrain", "st_cwl", "fixmatch",
-            "random", "al_entropy", "al_bald", "al_coreset"])],
-    "B": [(["vit_b16"], [], ["baseline", "cwl", "focal", "oversample", "diffusion"]),
-          (["cnn", "mobilenetv2"], [], ["baseline", "cwl", "focal", "oversample", "diffusion"])],
+    # one entry per GPU: (models, budget models, strategies in run order, extra --set, out sub-dir)
+    # GPU1 (faster EfficientNet) reaches the diffusion condition first and trains the shared diffusion model;
+    # GPU0 runs diffusion last in each fold, by which time the samples exist.
+    "A": [(["resnet50"], ["resnet50"], FULL + BUDGET + ["diffusion"], [], None),
+          (["efficientnet_b0"], ["efficientnet_b0"], FULL + ["diffusion"] + BUDGET, [], None)],
+    "B": [(["vit_b16"], [], FULL + ["diffusion"], [], None),
+          (["cnn", "mobilenetv2"], [], FULL + ["diffusion"], [], None)],
 }
+SENS = [("st_threshold", ["0.80", "0.95"], ["sup50", "selftrain"]),
+        ("lr", ["3e-05", "0.0003"], ["baseline"]),
+        ("focal_gamma", ["1.0", "3.0"], ["focal"])]
 
 
 def download():
@@ -70,9 +74,9 @@ def build_caches(roots):
     return meta, ext
 
 
-def cmd(roots, models, budget, strategies, deadline, extra_set=()):
+def cmd(roots, models, budget, strategies, deadline, extra_set=(), out=OUT):
     return [sys.executable, "run_experiments.py", "--data-dir", roots["ham"], "--isic2019-dir", roots["isic"],
-            "--ph2-dir", roots["ph2"], "--cache-dir", CACHE, "--out-dir", OUT, "--models", *models,
+            "--ph2-dir", roots["ph2"], "--cache-dir", CACHE, "--out-dir", out, "--models", *models,
             "--budget-models", *(budget or models), "--strategies", *strategies, "--deadline-hours", str(deadline),
             "--set", *COMMON_SET, *extra_set]
 
@@ -117,6 +121,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", required=True, choices=["test", "A", "B"])
     ap.add_argument("--hours", type=float, default=10.5, help="no new runs start after this (Kaggle limit is 12 h)")
+    ap.add_argument("--prev", default="", help="stage B: <user>/<notebook-slug> whose output holds stage A")
     a = ap.parse_args()
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     roots = download()
@@ -124,27 +129,40 @@ def main():
     if a.stage == "test":
         benchmark(roots)
         return
-    if a.stage == "B":   # reuse stage A's results and diffusion samples (attached as notebook input)
-        prev = glob.glob("/kaggle/input/**/results/main", recursive=True)
-        if prev and not os.path.exists(OUT):
-            shutil.copytree(prev[0], OUT)
-            pc = os.path.join(os.path.dirname(os.path.dirname(prev[0])), "cache")
-            for d in glob.glob(os.path.join(pc, "diffusion_fold*")):
+    if a.stage == "B":   # restore stage A's results and diffusion samples from the earlier notebook version
+        import kagglehub
+        prev = kagglehub.notebook_output_download(a.prev) if a.prev else None
+        src = glob.glob(os.path.join(prev, "**", "results", "main"), recursive=True) if prev else []
+        if src and not os.path.exists(os.path.join(OUT, "config.json")):
+            shutil.copytree(src[0], OUT, dirs_exist_ok=True)
+            for d in glob.glob(os.path.join(os.path.dirname(os.path.dirname(src[0])), "cache", "diffusion_fold*")):
                 shutil.copytree(d, os.path.join(CACHE, os.path.basename(d)), dirs_exist_ok=True)
-            print("restored stage A results and diffusion samples", flush=True)
+            print("restored stage A:", len(glob.glob(os.path.join(OUT, "fold*", "*", "*.json"))), "runs", flush=True)
     procs = []
-    for gpu, (models, budget, strategies) in enumerate(STAGES[a.stage]):
+    for gpu, (models, budget, strategies, extra, _) in enumerate(STAGES[a.stage]):
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
+        if a.stage == "B" and gpu == 1:      # GPU1 also runs the sensitivity analysis afterwards (ResNet50)
+            script = [cmd(roots, models, budget, strategies, a.hours)]
+            for param, vals, strats in SENS:
+                for v in vals:
+                    script.append(cmd(roots, ["resnet50"], ["resnet50"], strats, a.hours, [f"{param}={v}"],
+                                      out=os.path.join(W, "results", "sens", f"{param}={v}")))
+            sh = os.path.join(W, "gpu1_B.sh")
+            open(sh, "w").write("\n".join(" ".join(f"'{x}'" for x in c) for c in script) + "\n")
+            run = ["bash", sh]
+        else:
+            run = cmd(roots, models, budget, strategies, a.hours)
         log = open(os.path.join(W, f"log_{a.stage}_gpu{gpu}.txt"), "w")
-        procs.append(subprocess.Popen(cmd(roots, models, budget, strategies, a.hours), env=env, stdout=log,
-                                      stderr=subprocess.STDOUT))
+        procs.append(subprocess.Popen(run, env=env, stdout=log, stderr=subprocess.STDOUT))
         time.sleep(60)          # let the first process write folds/config before the second starts
     while any(p.poll() is None for p in procs):
         time.sleep(300)
         done = len(glob.glob(os.path.join(OUT, "fold*", "*", "*.json")))
         print(f"[{time.strftime('%H:%M')}] finished runs: {done}", flush=True)
     print("exit codes:", [p.returncode for p in procs], flush=True)
-    subprocess.run([sys.executable, "analyze.py", "--results", OUT, "--cache-dir", CACHE])
+    sens = os.path.join(W, "results", "sens")
+    subprocess.run([sys.executable, "analyze.py", "--results", OUT, "--cache-dir", CACHE]
+                   + (["--sensitivity", sens] if os.path.isdir(sens) else []))
     for d in glob.glob(os.path.join(CACHE, "diffusion_fold*")):   # drop the large weights, keep samples
         for f in glob.glob(os.path.join(d, "unet_ema.pt")):
             os.remove(f)

@@ -48,6 +48,7 @@ class Config:
     gan_nz: int = 100
     gan_batch_size: int = 32
     diff_resolution: int = 128               # class-conditional DDPM trained on all training classes jointly
+    diff_channels: str = ""                  # U-Net widths, e.g. "64,128,128,256" ("" = default for the resolution)
     diff_train_steps: int = 40000
     diff_batch_size: int = 32
     diff_lr: float = 1e-4
