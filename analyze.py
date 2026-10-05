@@ -375,6 +375,7 @@ def sentences(df, edf, cdf, models, budget_models, V):
         if e:
             effs[(s, ref)] = e
             V[f"TXT_{SKEY[s]}vs{SKEY[ref]}"] = sentence(names[s][0].upper() + names[s][1:], refs[ref], e)
+            V[f"TXT_{SKEY[s]}vs{SKEY[ref]}_LC"] = V[f"TXT_{SKEY[s]}vs{SKEY[ref]}"][0].lower() + V[f"TXT_{SKEY[s]}vs{SKEY[ref]}"][1:]
     def family(items, refname, noun):
         up, down, mixed, ns = [], [], [], []
         for n, e in items:
@@ -412,28 +413,58 @@ def sentences(df, edf, cdf, models, budget_models, V):
             V[f"TXT_FAM_{key}"] = family(items, refname, noun)
     full = {s: effs[(s, r)] for s, r in FULL_FAMILY if (s, r) in effs}
     budget = {s: effs[(s, r)] for s, r in BUDGET_FAMILY[:-2] if (s, r) in effs}
-    for label, group in (("FULL", full), ("BUDGET", budget)):
-        if group:
-            order = sorted(group, key=lambda s: -group[s]["mean"])
-            V[f"TXT_ORDER_{label}"] = "; ".join(f"{names[s]} ({group[s]['mean']:+.3f}, significant for {len(group[s]['up'])}/{group[s]['n']})" for s in order)
-            V[f"TXT_TOP_{label}"] = names[order[0]]
-            V[f"TXT_TOP_{label}_D"] = f"{group[order[0]]['mean']:+.3f}"
-            V[f"TXT_TOP_{label}_SIG"] = f"{len(group[order[0]]['up'])} of {group[order[0]]['n']}"
+    def sig_txt(e):
+        a, b = len(e["up"]), len(e["down"])
+        if a and b: return f"significant gain for {a}/{e['n']}, loss for {b}/{e['n']}"
+        if a: return f"significant gain for {a}/{e['n']}"
+        if b: return f"significant loss for {b}/{e['n']}"
+        return "not significant for any architecture"
+    for label, group, regime, refname in (("FULL", full, "With full labels", "standard training"),
+                                          ("BUDGET", budget, "With 50% of the labels", "the equal-budget references")):
+        if not group:
+            continue
+        order = sorted(group, key=lambda s: -group[s]["mean"])
+        top, worst = order[0], order[-1]
+        V[f"TXT_ORDER_{label}"] = "; ".join(f"{names[s]} ({group[s]['mean']:+.3f}; {sig_txt(group[s])})" for s in order)
+        V[f"TXT_TOP_{label}"] = names[top]
+        V[f"TXT_TOP_{label}_D"] = f"{group[top]['mean']:+.3f}"
+        V[f"TXT_TOP_{label}_SIG"] = f"{len(group[top]['up'])} of {group[top]['n']}"
+        n_up = sum(len(e["up"]) for e in group.values()); n_dn = sum(len(e["down"]) for e in group.values())
+        n_tot = sum(e["n"] for e in group.values())
+        losers = [names[s] for s in order if group[s]["down"]]
+        if group[top]["mean"] > 0:
+            head = (f"{regime}, the largest mean change in macro-F1 relative to {refname} came from {names[top]} "
+                    f"({group[top]['mean']:+.3f}; {sig_txt(group[top])})")
+        else:
+            head = (f"{regime}, no strategy improved mean macro-F1 over {refname}; mean changes ranged from "
+                    f"{group[top]['mean']:+.3f} ({names[top]}) to {group[worst]['mean']:+.3f} ({names[worst]})")
+        tail = f"; {n_up} of {n_tot} strategy–architecture comparisons showed a significant gain and {n_dn} a significant loss"
+        if losers:
+            tail += f" ({', '.join(losers)})"
+        V[f"TXT_ABS_{label}"] = head + tail + "."
+        V[f"TXT_ABS_{label}_LC"] = V[f"TXT_ABS_{label}"][0].lower() + V[f"TXT_ABS_{label}"][1:]
+        rng = f"{group[top]['mean']:+.3f} ({names[top]}) to {group[worst]['mean']:+.3f} ({names[worst]})"
+        gains = f"significant gains in {n_up} and losses in {n_dn} of {n_tot} comparisons"
+        V[f"TXT_ABS_{label}_SHORT"] = (f"{regime}, mean macro-F1 changes relative to {refname} ranged from {rng}, with {gains}.")
     if full:
         n_any = sum(1 for e in full.values() if e["up"])
         V["TXT_FULL_SUMMARY"] = (f"{n_any} of {len(full)} full-label strategies improved macro-F1 significantly for at least one architecture"
                                  if n_any else "no full-label strategy improved macro-F1 significantly for any architecture")
     if not edf.empty and "isic2019" in set(edf.dataset) and full:
-        top = max(full, key=lambda s: full[s]["mean"])
         e = edf[edf.dataset == "isic2019"]
-        d_ext = e[e.strategy == top].groupby("model").macro_f1.mean() - e[e.strategy == "baseline"].groupby("model").macro_f1.mean()
-        d_ext = d_ext.dropna()
-        if len(d_ext):
-            V["TXT_TOP_FULL_EXT_D"] = f"{d_ext.mean():+.3f}"
-            V["TXT_EXT_TRANSFER"] = (f"On the external ISIC 2019 images, the mean change in macro-F1 for {names[top]} relative to the baseline "
-                                     f"was {d_ext.mean():+.3f} (internal: {full[top]['mean']:+.3f}), so its internal gain "
-                                     + ("largely carried over" if d_ext.mean() >= 0.5 * full[top]["mean"] > 0 else "did not fully carry over")
-                                     + " to images from other institutions.")
+        base = e[e.strategy == "baseline"].groupby("model").macro_f1.mean()
+        parts = []
+        for s in sorted(full, key=lambda s: -full[s]["mean"]):
+            d = (e[e.strategy == s].groupby("model").macro_f1.mean() - base).dropna()
+            if len(d):
+                V[f"EXT_D_{SKEY[s]}"] = f"{d.mean():+.3f}"
+                parts.append(f"{names[s]} {d.mean():+.3f} (internal {full[s]['mean']:+.3f})")
+        top = max(full, key=lambda s: full[s]["mean"])
+        if f"EXT_D_{SKEY[top]}" in V:
+            V["TXT_TOP_FULL_EXT_D"] = V[f"EXT_D_{SKEY[top]}"]
+        if parts:
+            V["TXT_EXT_TRANSFER"] = ("Relative to the baseline, the mean change in external ISIC 2019 macro-F1 was: "
+                                     + "; ".join(parts) + ".")
 
 
 # ------------------------------------------------------------------ figures (300 dpi)
@@ -559,16 +590,18 @@ def figures(runs, df, edf, pcf, cdf, models, budget_models, strategies, out, cac
             if os.path.exists(p):
                 ex[(gen, c)] = np.load(p)
     if ex:
-        cls = [c for c in MINORITY if any((g, c) in ex for g in ("dcgan", "diffusion"))]
+        gens = [g for g in ("dcgan", "diffusion") if any(k[0] == g for k in ex)]
+        per = 6 // len(gens)                                   # 6 columns: 3 per generator, or 6 for one generator
+        cls = [c for c in MINORITY if any((g, c) in ex for g in gens)]
         fig, ax = plt.subplots(len(cls), 6, figsize=(6.0, 1.05 * len(cls)), squeeze=False)
         for i, c in enumerate(cls):
             for j in range(6):
-                gen = "dcgan" if j < 3 else "diffusion"
+                gen, jj = gens[j // per], j % per
                 a_ = ax[i, j]; a_.axis("off")
-                if (gen, c) in ex and len(ex[(gen, c)]) > j % 3:
-                    a_.imshow(ex[(gen, c)][j % 3])
-                if i == 0:
-                    a_.set_title("DCGAN" if j == 1 else ("Diffusion" if j == 4 else ""), fontsize=8)
+                if (gen, c) in ex and len(ex[(gen, c)]) > jj:
+                    a_.imshow(ex[(gen, c)][jj])
+                if i == 0 and len(gens) > 1 and jj == 1:
+                    a_.set_title("DCGAN" if gen == "dcgan" else "Diffusion", fontsize=8)
             ax[i, 0].text(-0.15, 0.5, c, transform=ax[i, 0].transAxes, ha="right", va="center", fontsize=8)
         save(fig, out, "synthetic_examples")
 
